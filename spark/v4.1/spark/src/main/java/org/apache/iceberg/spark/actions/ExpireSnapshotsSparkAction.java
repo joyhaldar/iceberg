@@ -41,8 +41,13 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.JobGroupInfo;
+import org.apache.iceberg.spark.source.SerializableTableWithSize;
 import org.apache.iceberg.util.PropertyUtil;
+import org.apache.spark.api.java.function.MapFunction;
+import org.apache.spark.broadcast.Broadcast;
+import static org.apache.spark.sql.functions.col;
 import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.SparkSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -174,14 +179,53 @@ public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsS
 
       // fetch valid files after expiration
       TableMetadata updatedMetadata = ops.refresh();
-      Dataset<FileInfo> validFileDS = fileDS(updatedMetadata);
+      // Dataset<FileInfo> validFileDS = fileDS(updatedMetadata);
 
       // fetch files referenced by expired snapshots
+      // Set<Long> deletedSnapshotIds = findExpiredSnapshotIds(originalMetadata, updatedMetadata);
+      // Dataset<FileInfo> deleteCandidateFileDS = fileDS(originalMetadata, deletedSnapshotIds);
       Set<Long> deletedSnapshotIds = findExpiredSnapshotIds(originalMetadata, updatedMetadata);
-      Dataset<FileInfo> deleteCandidateFileDS = fileDS(originalMetadata, deletedSnapshotIds);
+      Set<Long> retainedSnapshotIds = updatedMetadata.snapshots().stream().map(Snapshot::snapshotId).collect(Collectors.toSet());
+
+      Table staticTable = newStaticTable(originalMetadata, table.io());
 
       // determine expired files
-      this.expiredFileDS = deleteCandidateFileDS.except(validFileDS);
+      // this.expiredFileDS = deleteCandidateFileDS.except(validFileDS);
+
+      // get manifest paths
+      Dataset<String> expiredManifestPaths = getManifestPaths(staticTable, deletedSnapshotIds);
+      Dataset<String> retainedManifestPaths = getManifestPaths(staticTable, retainedSnapshotIds);
+
+      // compute diff
+      Dataset<String> pathsToDelete = expiredManifestPaths.except(retainedManifestPaths);
+      Dataset<String> sharedPaths = expiredManifestPaths.intersect(retainedManifestPaths);
+
+      if (pathsToDelete.isEmpty()) {
+        LOG.info("No manifests to delete, skipping file cleanup.");
+        Dataset<FileInfo> manifestListsToDelete = manifestListDS(staticTable, deletedSnapshotIds);
+        Dataset<FileInfo> statsFilesToDelete = statisticsFileDS(staticTable, deletedSnapshotIds);
+        this.expiredFileDS = manifestListsToDelete.union(statsFilesToDelete);
+        // this.expiredFileDS = spark().emptyDataset(FileInfo.ENCODER);
+        return expiredFileDS;
+      }
+
+      // get files from manifests to delete
+      Dataset<FileInfo> filesToDeleteCandidates = getFileFromManifestPaths(staticTable, pathsToDelete, deletedSnapshotIds);
+
+      // get files from shared manifests
+      Dataset<FileInfo> sharedFiles = getFileFromManifestPaths(staticTable, sharedPaths, deletedSnapshotIds);
+
+      // compute files to delete, files in expired manifests that are not in shared manifests
+      Dataset<FileInfo> contentFilesToDelete = filesToDeleteCandidates.except(sharedFiles);
+
+      // add manifests to delete
+      Dataset<FileInfo> manifestsToDelete = pathsToDelete.map((MapFunction<String, FileInfo>) path -> new FileInfo(path, MANIFEST), FileInfo.ENCODER);
+
+      // add manifest lists and statistics files for expired snapshots
+      Dataset<FileInfo> manifestListsToDelete = manifestListDS(staticTable, deletedSnapshotIds);
+      Dataset<FileInfo> statsFilesToDelete = statisticsFileDS(staticTable, deletedSnapshotIds);
+      
+      this.expiredFileDS = contentFilesToDelete.union(manifestsToDelete).union(manifestListsToDelete).union(statsFilesToDelete);
     }
 
     return expiredFileDS;
@@ -282,5 +326,40 @@ public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsS
         .deletedManifestListsCount(summary.manifestListsCount())
         .deletedStatisticsFilesCount(summary.statisticsFilesCount())
         .build();
+  }
+
+  private Dataset<String> getManifestPaths(Table staticTable, Set<Long> snapshotIds) {
+    return manifestDF(staticTable, snapshotIds)
+      .select("path")
+      .distinct()
+      .as(Encoders.STRING());
+  }
+
+  private Dataset<FileInfo> getFileFromManifestPaths(Table staticTable, Dataset<String> manifestPaths, Set<Long> snapshotIds) {
+    List<String> manifestPathList = manifestPaths.collectAsList();
+    if (manifestPathList.isEmpty()) {
+      return spark().emptyDataset(FileInfo.ENCODER);
+    }
+
+    Table serializableTable = SerializableTableWithSize.copyOf(staticTable);
+    Broadcast<Table> tableBroadcast = sparkContext.broadcast(serializableTable);
+    int numShufflePartitions = spark().sessionState().conf().numShufflePartitions();
+
+    Dataset<ManifestFileBean> manifestBeanDS =
+      manifestDF(staticTable, snapshotIds)
+          .filter(col("path").isin(manifestPathList.toArray()))
+          .selectExpr(
+              "content",
+              "path",
+              "length",
+              "0 as sequenceNumber",
+              "partition_spec_id as partitionSpecId",
+              "added_snapshot_id as addedSnapshotId",
+              "null as keyMetadata")
+          .dropDuplicates("path")
+          .repartition(Math.min(manifestPathList.size(), numShufflePartitions))
+          .as(ManifestFileBean.ENCODER);
+
+  return manifestBeanDS.flatMap(new ReadManifest(tableBroadcast), FileInfo.ENCODER);
   }
 }

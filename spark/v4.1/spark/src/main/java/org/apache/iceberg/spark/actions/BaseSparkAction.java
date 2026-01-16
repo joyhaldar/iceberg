@@ -94,7 +94,7 @@ abstract class BaseSparkAction<ThisT> {
   private static final int DELETE_GROUP_SIZE = 100000;
 
   private final SparkSession spark;
-  private final JavaSparkContext sparkContext;
+  protected final JavaSparkContext sparkContext;
   private final Map<String, String> options = Maps.newHashMap();
 
   protected BaseSparkAction(SparkSession spark) {
@@ -161,8 +161,7 @@ abstract class BaseSparkAction<ThisT> {
                 "length",
                 "0 as sequenceNumber",
                 "partition_spec_id as partitionSpecId",
-                "added_snapshot_id as addedSnapshotId",
-                "key_metadata as keyMetadata")
+                "added_snapshot_id as addedSnapshotId")
             .dropDuplicates("path")
             .repartition(numShufflePartitions) // avoid adaptive execution combining tasks
             .as(ManifestFileBean.ENCODER);
@@ -180,7 +179,7 @@ abstract class BaseSparkAction<ThisT> {
         .as(FileInfo.ENCODER);
   }
 
-  private Dataset<Row> manifestDF(Table table, Set<Long> snapshotIds) {
+  protected Dataset<Row> manifestDF(Table table, Set<Long> snapshotIds) {
     Dataset<Row> manifestDF = loadMetadataTable(table, ALL_MANIFESTS);
     if (snapshotIds != null) {
       Column filterCond = col(AllManifestsTable.REF_SNAPSHOT_ID.name()).isInCollection(snapshotIds);
@@ -405,7 +404,7 @@ abstract class BaseSparkAction<ThisT> {
     }
   }
 
-  private static class ReadManifest implements FlatMapFunction<ManifestFileBean, FileInfo> {
+  protected static class ReadManifest implements FlatMapFunction<ManifestFileBean, FileInfo> {
     private final Broadcast<Table> table;
 
     ReadManifest(Broadcast<Table> table) {
